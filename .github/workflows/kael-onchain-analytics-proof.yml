@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - kael/onchain-proof-20260908
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read
