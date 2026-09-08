@@ -1,0 +1,169 @@
+name: Kael bounded on-chain analytics proof
+
+on:
+  push:
+    branches:
+      - kael/onchain-proof-20260908
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fetch and analyze bounded Solana pool trades
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p proof
+          python - <<'PY'
+          import hashlib, json, statistics, time, urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          url = "https://api.geckoterminal.com/api/v2/networks/solana/pools/Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE/trades"
+          headers = {
+              "Accept": "application/json;version=20230203",
+              "User-Agent": "KaelAnalyticsProof/1.0",
+          }
+          raw = None
+          last_error = None
+          for attempt in range(3):
+              try:
+                  req = urllib.request.Request(url, headers=headers)
+                  with urllib.request.urlopen(req, timeout=20) as r:
+                      raw = r.read()
+                  break
+              except Exception as exc:
+                  last_error = repr(exc)
+                  time.sleep(2 ** attempt)
+          if raw is None:
+              raise SystemExit(f"source acquisition failed after 3 attempts: {last_error}")
+
+          Path("proof/raw.json").write_bytes(raw)
+          payload = json.loads(raw)
+          rows = payload.get("data")
+          if not isinstance(rows, list) or not rows:
+              raise SystemExit("source returned no trade rows")
+          if len(rows) > 300:
+              raise SystemExit(f"unexpected row count > 300: {len(rows)}")
+
+          parsed = []
+          for row in rows:
+              a = row.get("attributes") or {}
+              try:
+                  usd = float(a["volume_in_usd"])
+              except (KeyError, TypeError, ValueError):
+                  continue
+              parsed.append({
+                  "id": row.get("id"),
+                  "tx_hash": a.get("tx_hash"),
+                  "wallet": a.get("tx_from_address"),
+                  "kind": a.get("kind"),
+                  "timestamp": a.get("block_timestamp"),
+                  "volume_usd": usd,
+                  "from_token_amount": a.get("from_token_amount"),
+                  "to_token_amount": a.get("to_token_amount"),
+              })
+          if not parsed:
+              raise SystemExit("no rows contained numeric volume_in_usd")
+
+          volumes = [r["volume_usd"] for r in parsed]
+          sorted_vol = sorted(volumes, reverse=True)
+          total = sum(volumes)
+          kinds = {}
+          kind_volume = {}
+          for r in parsed:
+              k = r["kind"] if r["kind"] is not None else "UNKNOWN"
+              kinds[k] = kinds.get(k, 0) + 1
+              kind_volume[k] = kind_volume.get(k, 0.0) + r["volume_usd"]
+
+          wallets = {r["wallet"] for r in parsed if r["wallet"]}
+          txs = {r["tx_hash"] for r in parsed if r["tx_hash"]}
+          timestamps = sorted(r["timestamp"] for r in parsed if r["timestamp"])
+          def top_share(n):
+              return sum(sorted_vol[:n]) / total if total else None
+
+          retrieved_at = datetime.now(timezone.utc).isoformat()
+          raw_sha = hashlib.sha256(raw).hexdigest()
+          result = {
+              "schema": "kael.verified-result/1-compatible-onchain-proof",
+              "analysis": {
+                  "id": "onchain.solana.orca.sol-usdc.recent-trade-concentration",
+                  "version": "1.0.0",
+              },
+              "semantic_contract_version": "geckoterminal-solana-pool-trades/1.0.0",
+              "semantic_contract": {
+                  "row_grain": "One trade record returned by the GeckoTerminal pool-trades endpoint",
+                  "key": "provider trade id; tx_hash retained separately",
+                  "units": {"volume_in_usd": "provider-estimated USD"},
+                  "denominator": "Only rows returned by this bounded endpoint response with numeric volume_in_usd",
+                  "time_semantics": "Provider block_timestamp; retrieval timestamp is separate",
+                  "coverage": "Latest up to 300 trades from the provider's past-24-hour endpoint; NOT complete 24-hour pool volume",
+                  "missingness": "Missing provider fields remain missing; rows without numeric volume_in_usd are excluded and counted",
+                  "aggregation": "Trade turnover and concentration within this returned sample only",
+                  "deduplication": "No cross-pool or route-level deduplication; do not interpret pool legs as routed user intent",
+                  "claim_ceiling": "Bounded real on-chain-derived provider sample; no profitability, personal identity, complete-market, or routed-intent claim"
+              },
+              "source": {
+                  "provider": "GeckoTerminal Public API",
+                  "endpoint": url,
+                  "api_version": "20230203",
+                  "network": "solana",
+                  "dex": "orca",
+                  "pool_address": "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE",
+                  "pair": "SOL/USDC",
+                  "retrieved_at": retrieved_at,
+                  "raw_sha256": raw_sha,
+                  "returned_rows": len(rows),
+                  "usable_rows": len(parsed),
+                  "excluded_rows_missing_numeric_volume": len(rows) - len(parsed),
+                  "completeness": "BOUNDED_ENDPOINT_SAMPLE_NOT_FULL_24H"
+              },
+              "metrics": {
+                  "trade_records": len(parsed),
+                  "unique_tx_hashes_known": len(txs),
+                  "unique_wallet_addresses_known": len(wallets),
+                  "sample_volume_usd": total,
+                  "mean_trade_volume_usd": statistics.fmean(volumes),
+                  "median_trade_volume_usd": statistics.median(volumes),
+                  "max_trade_volume_usd": max(volumes),
+                  "top_1_trade_share": top_share(1),
+                  "top_5_trade_share": top_share(5),
+                  "top_10_trade_share": top_share(10),
+                  "kind_counts": kinds,
+                  "kind_volume_usd": kind_volume,
+                  "first_timestamp": timestamps[0] if timestamps else None,
+                  "last_timestamp": timestamps[-1] if timestamps else None
+              },
+              "failure": None,
+              "partial_state": "BOUNDED_SOURCE_WINDOW",
+              "freshness": {
+                  "state": "SOURCE_RETRIEVED_THIS_RUN",
+                  "evaluated_at": retrieved_at,
+                  "note": "Fresh retrieval does not make the endpoint sample exhaustive."
+              }
+          }
+          canonical = json.dumps(result, sort_keys=True, separators=(",", ":")).encode()
+          result["result_identity_sha256"] = hashlib.sha256(canonical).hexdigest()
+          Path("proof/result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+          manifest = {
+              "schema": "kael.onchain-proof-manifest/1",
+              "raw_sha256": raw_sha,
+              "result_sha256": hashlib.sha256(Path("proof/result.json").read_bytes()).hexdigest(),
+              "files": ["raw.json", "result.json"],
+              "claim_ceiling": result["semantic_contract"]["claim_ceiling"],
+          }
+          Path("proof/MANIFEST.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+          print(json.dumps(result["metrics"], indent=2, sort_keys=True))
+          PY
+
+      - name: Upload exact source snapshot and analytical result
+        uses: actions/upload-artifact@v4
+        with:
+          name: kael-onchain-proof
+          path: proof/
+          if-no-files-found: error
+          retention-days: 7
